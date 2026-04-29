@@ -77,15 +77,33 @@ async function handleCallback(req, res, next) {
     }
 
     // Exchange code for GitHub access token
-    const tokenRes = await axios.post(
-      'https://github.com/login/oauth/access_token',
-      exchangePayload,
-      { headers: { Accept: 'application/json' } }
-    );
+    // Wrapped in try/catch because GitHub can return 400 for bad_verification_code etc.
+    let tokenRes;
+    try {
+      tokenRes = await axios.post(
+        'https://github.com/login/oauth/access_token',
+        exchangePayload,
+        { headers: { Accept: 'application/json' } }
+      );
+    } catch (axiosErr) {
+      const errData = axiosErr.response?.data || {};
+      console.error('GitHub token exchange error:', axiosErr.response?.status, JSON.stringify(errData));
+      return res.status(400).json({
+        status:  'error',
+        message: 'GitHub token exchange failed: ' + (errData.error_description || errData.error || axiosErr.message),
+      });
+    }
 
     const githubAccessToken = tokenRes.data.access_token;
     if (!githubAccessToken) {
-      console.error('GitHub token exchange failed:', tokenRes.data);
+      // Log the full GitHub response so we can see exactly why it failed
+      console.error('GitHub token exchange failed. Full response:', JSON.stringify(tokenRes.data));
+      console.error('Exchange payload sent (no secret):', JSON.stringify({
+        client_id:    exchangePayload.client_id,
+        code:         exchangePayload.code,
+        redirect_uri: exchangePayload.redirect_uri,
+        has_verifier: !!exchangePayload.code_verifier,
+      }));
       return res.status(400).json({
         status:  'error',
         message: 'GitHub token exchange failed: ' + (tokenRes.data.error_description || tokenRes.data.error || 'unknown'),
