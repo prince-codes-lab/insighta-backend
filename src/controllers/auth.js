@@ -142,13 +142,23 @@ async function handleCallback(req, res, next) {
         last_login_at: new Date(),
         created_at:    new Date(),
       });
-    } else {
-      user.username      = ghUser.login;
-      user.email         = primary;
-      user.avatar_url    = ghUser.avatar_url;
-      user.last_login_at = new Date();
-      await user.save();
+    } } else {
+  await User.updateOne(
+    { github_id: String(ghUser.id) },
+    {
+      $set: {
+        username:      ghUser.login,
+        email:         primary,
+        avatar_url:    ghUser.avatar_url,
+        last_login_at: new Date(),
+      },
     }
+  );
+  user.username      = ghUser.login;
+  user.email         = primary;
+  user.avatar_url    = ghUser.avatar_url;
+  user.last_login_at = new Date();
+}
 
     if (!user.is_active) {
       return res.status(403).json({ status: 'error', message: 'Account is deactivated' });
