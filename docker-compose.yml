@@ -1,0 +1,25 @@
+version: '3.9'
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - '27017:27017'
+    volumes:
+      - mongodata:/data/db
+
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - '3000:3000'
+    environment:
+      MONGODB_URI: mongodb://mongo:27017/insighta
+      SEED_FILE_URL: ${SEED_FILE_URL}
+      PORT: 3000
+    depends_on:
+      - mongo
+
+volumes:
+  mongodata:
