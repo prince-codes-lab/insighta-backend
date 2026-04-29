@@ -1,45 +1,25 @@
 const mongoose = require('mongoose');
 
 /**
- * Temporarily stores PKCE state and code_challenge during the OAuth flow.
- *
- * Created when the OAuth flow begins (GET /auth/github).
- * Read and deleted when the callback arrives (GET /auth/github/callback).
- * Auto-deleted by MongoDB TTL after 10 minutes if never used.
+ * Temporarily stores PKCE state during OAuth flow.
+ * Includes code_verifier so the backend can complete the exchange
+ * without needing the CLI to send it again in the callback.
  */
 const oauthStateSchema = new mongoose.Schema(
   {
-    state: {
-      type:     String,
-      required: true,
-      unique:   true,
-    },
-    // The hashed version of code_verifier, sent to GitHub during callback.
-    // Only present for CLI (PKCE) flows. Null for browser flows.
-    code_challenge: {
-      type:    String,
-      default: null,
-    },
-    // 'cli' or 'web'
-    source: {
-      type:    String,
-      default: 'web',
-    },
+    state:          { type: String, required: true, unique: true },
+    code_challenge: { type: String, default: null },
+    code_verifier:  { type: String, default: null }, // stored for CLI PKCE exchange
+    source:         { type: String, default: 'web' }, // 'cli' or 'web'
     expires_at: {
       type:    Date,
-      default: () => new Date(Date.now() + 10 * 60 * 1000), // 10 minutes
+      default: () => new Date(Date.now() + 10 * 60 * 1000),
     },
   },
-  {
-    _id:        true,
-    versionKey: false,
-  }
+  { _id: true, versionKey: false }
 );
 
-// Auto-delete after expires_at
 oauthStateSchema.index({ expires_at: 1 }, { expireAfterSeconds: 0 });
 oauthStateSchema.index({ state: 1 });
 
-const OAuthState = mongoose.model('OAuthState', oauthStateSchema, 'oauth_states');
-
-module.exports = OAuthState;
+module.exports = mongoose.model('OAuthState', oauthStateSchema, 'oauth_states');

@@ -5,23 +5,36 @@ const User           = require('../models/User');
 const OAuthState     = require('../models/OAuthState');
 const { issueTokens, rotateRefreshToken, revokeAllUserTokens } = require('../utils/tokenService');
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
 function randomBase64url(bytes = 32) {
   return crypto.randomBytes(bytes).toString('base64url');
 }
 
+function sha256Base64url(str) {
+  return crypto.createHash('sha256').update(str).digest('base64url');
+}
+
 // ── GET /auth/github ──────────────────────────────────────────────────────────
+// For CLI: receives state + code_verifier from CLI, derives challenge itself
+// For web: generates state itself, no PKCE
 
 async function initiateOAuth(req, res, next) {
   try {
-    const { state: cliState, code_challenge: cliChallenge, source } = req.query;
+    const { state: cliState, code_verifier: cliVerifier, source } = req.query;
+    const flowSource = source === 'cli' ? 'cli' : 'web';
 
-    const state          = cliState || randomBase64url(32);
-    const code_challenge = cliChallenge || null;
-    const flowSource     = source === 'cli' ? 'cli' : 'web';
+    const state = cliState || randomBase64url(32);
 
-    await OAuthState.create({ state, code_challenge, source: flowSource });
+    let code_challenge = null;
+    let code_verifier  = null;
+
+    if (flowSource === 'cli' && cliVerifier) {
+      // CLI sends us the verifier — we derive the challenge and store both
+      code_verifier  = cliVerifier;
+      code_challenge = sha256Base64url(cliVerifier);
+    }
+
+    // Store state + verifier so callback can complete the exchange
+    await OAuthState.create({ state, code_challenge, code_verifier, source: flowSource });
 
     const params = new URLSearchParams({
       client_id:    process.env.GITHUB_CLIENT_ID,
@@ -30,8 +43,8 @@ async function initiateOAuth(req, res, next) {
       state,
     });
 
-    // Only add PKCE params for CLI flows
-    if (code_challenge && flowSource === 'cli') {
+    // Only add PKCE params when we have a challenge (CLI flow)
+    if (code_challenge) {
       params.set('code_challenge',        code_challenge);
       params.set('code_challenge_method', 'S256');
     }
@@ -53,18 +66,16 @@ async function handleCallback(req, res, next) {
       return res.status(400).json({ status: 'error', message: 'Missing code or state' });
     }
 
-    // Validate state
+    // Validate and retrieve stored state
     const storedState = await OAuthState.findOne({ state });
     if (!storedState) {
       return res.status(400).json({ status: 'error', message: 'Invalid or expired state' });
     }
 
-    // Delete immediately — one-time use
+    // Delete immediately — one time use
     await OAuthState.deleteOne({ state });
 
-    // Build token exchange payload
-    // IMPORTANT: only include code_verifier for CLI flows
-    // Sending code_verifier on a web flow (where no challenge was sent) causes GitHub 400
+    // Build exchange payload
     const exchangePayload = {
       client_id:     process.env.GITHUB_CLIENT_ID,
       client_secret: process.env.GITHUB_CLIENT_SECRET,
@@ -72,12 +83,12 @@ async function handleCallback(req, res, next) {
       redirect_uri:  process.env.GITHUB_CALLBACK_URL,
     };
 
-    if (storedState.source === 'cli' && req.query.code_verifier) {
-      exchangePayload.code_verifier = req.query.code_verifier;
+    // If this was a PKCE flow, include the stored code_verifier
+    if (storedState.source === 'cli' && storedState.code_verifier) {
+      exchangePayload.code_verifier = storedState.code_verifier;
     }
 
     // Exchange code for GitHub access token
-    // Wrapped in try/catch because GitHub can return 400 for bad_verification_code etc.
     let tokenRes;
     try {
       tokenRes = await axios.post(
@@ -96,14 +107,7 @@ async function handleCallback(req, res, next) {
 
     const githubAccessToken = tokenRes.data.access_token;
     if (!githubAccessToken) {
-      // Log the full GitHub response so we can see exactly why it failed
-      console.error('GitHub token exchange failed. Full response:', JSON.stringify(tokenRes.data));
-      console.error('Exchange payload sent (no secret):', JSON.stringify({
-        client_id:    exchangePayload.client_id,
-        code:         exchangePayload.code,
-        redirect_uri: exchangePayload.redirect_uri,
-        has_verifier: !!exchangePayload.code_verifier,
-      }));
+      console.error('GitHub token exchange failed. Response:', JSON.stringify(tokenRes.data));
       return res.status(400).json({
         status:  'error',
         message: 'GitHub token exchange failed: ' + (tokenRes.data.error_description || tokenRes.data.error || 'unknown'),
@@ -153,7 +157,7 @@ async function handleCallback(req, res, next) {
     // Issue our tokens
     const tokens = await issueTokens(user);
 
-    // CLI flow — return JSON
+    // ── CLI flow — return JSON ────────────────────────────────────────────────
     if (storedState.source === 'cli') {
       return res.status(200).json({
         status:        'success',
@@ -168,20 +172,16 @@ async function handleCallback(req, res, next) {
       });
     }
 
-    // Web flow — set HTTP-only cookies and redirect to portal
+    // ── Web flow — set HTTP-only cookies and redirect ─────────────────────────
     const isProduction = process.env.NODE_ENV === 'production';
-    res.cookie('access_token', tokens.access_token, {
+    const cookieOptions = {
       httpOnly: true,
       secure:   isProduction,
       sameSite: isProduction ? 'none' : 'lax',
-      maxAge:   3 * 60 * 1000,
-    });
-    res.cookie('refresh_token', tokens.refresh_token, {
-      httpOnly: true,
-      secure:   isProduction,
-      sameSite: isProduction ? 'none' : 'lax',
-      maxAge:   5 * 60 * 1000,
-    });
+    };
+
+    res.cookie('access_token',  tokens.access_token,  { ...cookieOptions, maxAge: 3 * 60 * 1000 });
+    res.cookie('refresh_token', tokens.refresh_token, { ...cookieOptions, maxAge: 5 * 60 * 1000 });
 
     const portalUrl = process.env.WEB_PORTAL_URL || 'http://localhost:5173';
     return res.redirect(`${portalUrl}/?loggedin=1`);
@@ -205,18 +205,13 @@ async function refreshTokens(req, res, next) {
 
     if (req.cookies?.refresh_token) {
       const isProduction = process.env.NODE_ENV === 'production';
-      res.cookie('access_token', tokens.access_token, {
+      const cookieOptions = {
         httpOnly: true,
         secure:   isProduction,
         sameSite: isProduction ? 'none' : 'lax',
-        maxAge:   3 * 60 * 1000,
-      });
-      res.cookie('refresh_token', tokens.refresh_token, {
-        httpOnly: true,
-        secure:   isProduction,
-        sameSite: isProduction ? 'none' : 'lax',
-        maxAge:   5 * 60 * 1000,
-      });
+      };
+      res.cookie('access_token',  tokens.access_token,  { ...cookieOptions, maxAge: 3 * 60 * 1000 });
+      res.cookie('refresh_token', tokens.refresh_token, { ...cookieOptions, maxAge: 5 * 60 * 1000 });
     }
 
     return res.status(200).json({
