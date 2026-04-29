@@ -7,13 +7,25 @@ const profileRoutes  = require('./routes/profiles');
 
 const app = express();
 
+// ── Trust proxy ────────────────────────────────────────────────────────────────
+// PXXL (and most hosting platforms) sit behind a reverse proxy.
+// This tells Express to trust the X-Forwarded-For header so that:
+//  1. req.ip returns the real client IP (not the proxy IP)
+//  2. express-rate-limit works correctly
+app.set('trust proxy', 1);
+
 // ── CORS ───────────────────────────────────────────────────────────────────────
 app.use(cors({
-  origin:      [process.env.WEB_PORTAL_URL || 'http://localhost:5173', /localhost/],
-  credentials: true,   // needed for cookies to work cross-origin
+  origin:      function(origin, callback) {
+    // Allow requests with no origin (curl, mobile apps, same-origin)
+    if (!origin) return callback(null, true);
+    return callback(null, true);
+  },
+  credentials: true,
 }));
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
   next();
 });
 
